@@ -228,12 +228,20 @@ export class TwitterSearchClient {
             // Generate image descriptions using GPT-4 vision API
             const imageDescriptions = [];
             for (const photo of selectedTweet.photos) {
-                const description = await this.runtime
-                    .getService<IImageDescriptionService>(
+                try {
+                    const imageDescriptionService = this.runtime.getService<IImageDescriptionService>(
                         ServiceType.IMAGE_DESCRIPTION
-                    )
-                    .describeImage(photo.url);
-                imageDescriptions.push(description);
+                    );
+                    
+                    if (imageDescriptionService) {
+                        const description = await imageDescriptionService.describeImage(photo.url);
+                        imageDescriptions.push(description);
+                    } else {
+                        elizaLogger.warn("Image description service not available");
+                    }
+                } catch (error) {
+                    elizaLogger.error("Error describing image:", error);
+                }
             }
 
             let state = await this.runtime.composeState(message, {
