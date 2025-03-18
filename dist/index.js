@@ -561,7 +561,7 @@ import {
   ActionTimelineType as ActionTimelineType2
 } from "@elizaos/core";
 
-// ../../node_modules/zod/lib/index.mjs
+// ../../node_modules/.pnpm/zod@3.24.1/node_modules/zod/lib/index.mjs
 var util;
 (function(util2) {
   util2.assertEqual = (val) => val;
@@ -5687,6 +5687,7 @@ var TwitterPostClient = class {
   approvalRequired = false;
   discordApprovalChannelId;
   approvalCheckInterval;
+  axieDataCache;
   constructor(client, runtime) {
     var _a;
     this.client = client;
@@ -5984,8 +5985,11 @@ var TwitterPostClient = class {
         this.runtime.character.name,
         "twitter"
       );
+      const axieData = await this.fetchAxieDataForTweet();
+      elizaLogger4.log(`Axie data for tweet generation: ${axieData ? "available" : "not available"}`);
       const topics = this.runtime.character.topics.join(", ");
       const maxTweetLength = this.client.twitterConfig.MAX_TWEET_LENGTH;
+      elizaLogger4.log("Composing state with Axie data");
       const state = await this.runtime.composeState(
         {
           userId: this.runtime.agentId,
@@ -5998,94 +6002,178 @@ var TwitterPostClient = class {
         },
         {
           twitterUserName: this.client.profile.username,
-          maxTweetLength
+          maxTweetLength,
+          axieData: axieData ? axieData.text : null,
+          axieMetrics: axieData && axieData.content && axieData.content.success ? axieData.content.data : null
         }
       );
+      elizaLogger4.log("Creating template with Axie data");
+      const template = ((_a = this.runtime.character.templates) == null ? void 0 : _a.twitterPostTemplate) || `${twitterPostTemplate}
+                    {{#if axieData}}
+                    # Axie Ecosystem Data
+                    Include this data in your tweet in an engaging way:
+                    {{axieData}}
+                    {{/if}}`;
+      elizaLogger4.log("Composing context for tweet generation");
       const context = composeContext2({
         state,
-        template: ((_a = this.runtime.character.templates) == null ? void 0 : _a.twitterPostTemplate) || twitterPostTemplate
+        template
       });
-      elizaLogger4.debug("generate post prompt:\n" + context);
-      const response = await generateText({
-        runtime: this.runtime,
-        context,
-        modelClass: ModelClass2.SMALL
-      });
-      const rawTweetContent = cleanJsonResponse(response);
-      let tweetTextForPosting = null;
-      let mediaData = null;
-      const parsedResponse = parseJSONObjectFromText(rawTweetContent);
-      if (parsedResponse == null ? void 0 : parsedResponse.text) {
-        tweetTextForPosting = parsedResponse.text;
-      } else {
-        tweetTextForPosting = rawTweetContent.trim();
-      }
-      if ((parsedResponse == null ? void 0 : parsedResponse.attachments) && (parsedResponse == null ? void 0 : parsedResponse.attachments.length) > 0) {
-        mediaData = await fetchMediaData(parsedResponse.attachments);
-      }
-      if (!tweetTextForPosting) {
-        const parsingText = extractAttributes(rawTweetContent, [
-          "text"
-        ]).text;
-        if (parsingText) {
-          tweetTextForPosting = truncateToCompleteSentence(
-            extractAttributes(rawTweetContent, ["text"]).text,
-            this.client.twitterConfig.MAX_TWEET_LENGTH
-          );
-        }
-      }
-      if (!tweetTextForPosting) {
-        tweetTextForPosting = rawTweetContent;
-      }
-      if (maxTweetLength) {
-        tweetTextForPosting = truncateToCompleteSentence(
-          tweetTextForPosting,
-          maxTweetLength
-        );
-      }
-      const removeQuotes = (str) => str.replace(/^['"](.*)['"]$/, "$1");
-      const fixNewLines = (str) => str.replaceAll(/\\n/g, "\n\n");
-      tweetTextForPosting = removeQuotes(
-        fixNewLines(tweetTextForPosting)
-      );
-      if (this.isDryRun) {
-        elizaLogger4.info(
-          `Dry run: would have posted tweet: ${tweetTextForPosting}`
-        );
-        return;
-      }
+      elizaLogger4.debug("Generate post prompt:\n" + context);
+      elizaLogger4.log("Generating tweet text");
       try {
-        if (this.approvalRequired) {
-          elizaLogger4.log(
-            `Sending Tweet For Approval:
- ${tweetTextForPosting}`
-          );
-          await this.sendForApproval(
-            tweetTextForPosting,
-            roomId,
-            rawTweetContent
-          );
-          elizaLogger4.log("Tweet sent for approval");
+        const response = await generateText({
+          runtime: this.runtime,
+          context,
+          modelClass: ModelClass2.SMALL
+        });
+        elizaLogger4.log("Successfully generated tweet text");
+        const rawTweetContent = cleanJsonResponse(response);
+        let tweetTextForPosting = null;
+        let mediaData = null;
+        const parsedResponse = parseJSONObjectFromText(rawTweetContent);
+        if (parsedResponse == null ? void 0 : parsedResponse.text) {
+          tweetTextForPosting = parsedResponse.text;
         } else {
-          elizaLogger4.log(
-            `Posting new tweet:
- ${tweetTextForPosting}`
-          );
-          this.postTweet(
-            this.runtime,
-            this.client,
+          tweetTextForPosting = rawTweetContent.trim();
+        }
+        if ((parsedResponse == null ? void 0 : parsedResponse.attachments) && (parsedResponse == null ? void 0 : parsedResponse.attachments.length) > 0) {
+          mediaData = await fetchMediaData(parsedResponse.attachments);
+        }
+        if (!tweetTextForPosting) {
+          const parsingText = extractAttributes(rawTweetContent, [
+            "text"
+          ]).text;
+          if (parsingText) {
+            tweetTextForPosting = truncateToCompleteSentence(
+              extractAttributes(rawTweetContent, ["text"]).text,
+              this.client.twitterConfig.MAX_TWEET_LENGTH
+            );
+          }
+        }
+        if (!tweetTextForPosting) {
+          tweetTextForPosting = rawTweetContent;
+        }
+        if (maxTweetLength) {
+          tweetTextForPosting = truncateToCompleteSentence(
             tweetTextForPosting,
-            roomId,
-            rawTweetContent,
-            this.twitterUsername,
-            mediaData
+            maxTweetLength
           );
         }
-      } catch (error) {
-        elizaLogger4.error("Error sending tweet:", error);
+        const removeQuotes = (str) => str.replace(/^['"](.*)['"]$/, "$1");
+        const fixNewLines = (str) => str.replaceAll(/\\n/g, "\n\n");
+        tweetTextForPosting = removeQuotes(
+          fixNewLines(tweetTextForPosting)
+        );
+        if (this.isDryRun) {
+          elizaLogger4.info("=== DRY RUN MODE ===");
+          elizaLogger4.info(`Tweet content: ${tweetTextForPosting}`);
+          if (axieData) {
+            elizaLogger4.info(`Used Axie data: ${axieData.text}`);
+          }
+          elizaLogger4.info(`Raw tweet content: ${rawTweetContent}`);
+          elizaLogger4.info("No actual tweet was posted (dry run mode)");
+          return;
+        }
+        try {
+          if (this.approvalRequired) {
+            elizaLogger4.log(
+              `Sending Tweet For Approval:
+ ${tweetTextForPosting}`
+            );
+            await this.sendForApproval(
+              tweetTextForPosting,
+              roomId,
+              rawTweetContent
+            );
+            elizaLogger4.log("Tweet sent for approval");
+          } else {
+            elizaLogger4.log(
+              `Posting new tweet:
+ ${tweetTextForPosting}`
+            );
+            this.postTweet(
+              this.runtime,
+              this.client,
+              tweetTextForPosting,
+              roomId,
+              rawTweetContent,
+              this.twitterUsername,
+              mediaData
+            );
+          }
+        } catch (error) {
+          elizaLogger4.error("Error sending tweet:", error);
+        }
+      } catch (textGenError) {
+        elizaLogger4.error("Error in text generation step:", textGenError);
+        throw textGenError;
       }
     } catch (error) {
       elizaLogger4.error("Error generating new tweet:", error);
+      if (error instanceof Error) {
+        elizaLogger4.error(`Error name: ${error.name}`);
+        elizaLogger4.error(`Error message: ${error.message}`);
+        elizaLogger4.error(`Error stack: ${error.stack}`);
+      } else {
+        elizaLogger4.error(`Non-Error object thrown: ${JSON.stringify(error)}`);
+      }
+    }
+  }
+  /**
+   * Fetches Axie data for tweet generation
+   * @returns Promise with Axie data or null if unavailable
+   */
+  async fetchAxieDataForTweet() {
+    try {
+      if (!this.axieDataCache) {
+        this.axieDataCache = /* @__PURE__ */ new Map();
+      }
+      const CACHE_TTL = 30 * 60 * 1e3;
+      const axieTypes = ["summer", "japan", "origin", "mystic", "xmas", "charms"];
+      const metrics = ["volume", "holders", "floor"];
+      const selectedType = axieTypes[Math.floor(Math.random() * axieTypes.length)];
+      const selectedMetric = metrics[Math.floor(Math.random() * metrics.length)];
+      elizaLogger4.info(`Fetching Axie data for ${selectedType} ${selectedMetric}`);
+      const cacheKey = `${selectedType}-${selectedMetric}`;
+      const cachedData = this.axieDataCache.get(cacheKey);
+      if (cachedData && Date.now() - cachedData.timestamp < CACHE_TTL) {
+        elizaLogger4.debug(`Using cached Axie data for ${cacheKey}`);
+        return cachedData.data;
+      }
+      const simulatedMessage = {
+        content: {
+          text: `Fetch the ${selectedMetric} for ${selectedType} Axies`
+        }
+      };
+      const rpcAction = this.runtime.actions.find((action) => action.name === "RPC_ACTION");
+      if (!rpcAction) {
+        elizaLogger4.warn("RPC_ACTION not found in runtime actions");
+        return null;
+      }
+      const axieData = await new Promise((resolve) => {
+        const callback = (response) => {
+          resolve(response);
+        };
+        rpcAction.handler(
+          this.runtime,
+          simulatedMessage,
+          {},
+          {},
+          callback
+        );
+      });
+      elizaLogger4.info(`Fetched Axie data: ${JSON.stringify(axieData)}`);
+      if (axieData && typeof axieData === "object" && "content" in axieData && axieData.content && "success" in axieData.content) {
+        this.axieDataCache.set(cacheKey, {
+          data: axieData,
+          timestamp: Date.now()
+        });
+      }
+      return axieData;
+    } catch (error) {
+      elizaLogger4.error("Error fetching Axie data for tweet:", error);
+      return null;
     }
   }
   async generateTweetContent(tweetState, options) {
@@ -6947,10 +7035,19 @@ Text: ${tweet.text}
       }
       const imageDescriptions = [];
       for (const photo of selectedTweet.photos) {
-        const description = await this.runtime.getService(
-          ServiceType3.IMAGE_DESCRIPTION
-        ).describeImage(photo.url);
-        imageDescriptions.push(description);
+        try {
+          const imageDescriptionService = this.runtime.getService(
+            ServiceType3.IMAGE_DESCRIPTION
+          );
+          if (imageDescriptionService) {
+            const description = await imageDescriptionService.describeImage(photo.url);
+            imageDescriptions.push(description);
+          } else {
+            elizaLogger5.warn("Image description service not available");
+          }
+        } catch (error) {
+          elizaLogger5.error("Error describing image:", error);
+        }
       }
       let state = await this.runtime.composeState(message, {
         twitterClient: this.client.twitterClient,

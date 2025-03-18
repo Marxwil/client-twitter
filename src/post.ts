@@ -28,7 +28,7 @@ import {
     TextChannel,
     Partials,
 } from "discord.js";
-import type { State } from "@elizaos/core";
+import type { HandlerCallback, Memory, State } from "@elizaos/core";
 import type { ActionResponse } from "@elizaos/core";
 import { MediaData } from "./types.ts";
 
@@ -105,6 +105,7 @@ export class TwitterPostClient {
     private approvalRequired = false;
     private discordApprovalChannelId: string;
     private approvalCheckInterval: number;
+    private axieDataCache: Map<string, { data: any; timestamp: number }>;
 
     constructor(client: ClientBase, runtime: IAgentRuntime) {
         this.client = client;
@@ -511,8 +512,14 @@ export class TwitterPostClient {
                 "twitter"
             );
 
+            // Fetch Axie data before composing state
+            const axieData = await this.fetchAxieDataForTweet();
+            elizaLogger.log(`Axie data for tweet generation: ${axieData ? 'available' : 'not available'}`);
+
             const topics = this.runtime.character.topics.join(", ");
             const maxTweetLength = this.client.twitterConfig.MAX_TWEET_LENGTH;
+            
+            elizaLogger.log("Composing state with Axie data");
             const state = await this.runtime.composeState(
                 {
                     userId: this.runtime.agentId,
@@ -526,120 +533,237 @@ export class TwitterPostClient {
                 {
                     twitterUserName: this.client.profile.username,
                     maxTweetLength,
+                    axieData: axieData ? axieData.text : null,
+                    axieMetrics: axieData && axieData.content && axieData.content.success ? 
+                        axieData.content.data : null
                 }
             );
+            
+            // Update the template to include Axie data
+            elizaLogger.log("Creating template with Axie data");
+            const template = this.runtime.character.templates?.twitterPostTemplate || 
+                `${twitterPostTemplate}
+                    {{#if axieData}}
+                    # Axie Ecosystem Data
+                    Include this data in your tweet in an engaging way:
+                    {{axieData}}
+                    {{/if}}`;
 
+            elizaLogger.log("Composing context for tweet generation");
             const context = composeContext({
                 state,
-                template:
-                    this.runtime.character.templates?.twitterPostTemplate ||
-                    twitterPostTemplate,
+                template
             });
 
-            elizaLogger.debug("generate post prompt:\n" + context);
+            elizaLogger.debug("Generate post prompt:\n" + context);
 
-            const response = await generateText({
-                runtime: this.runtime,
-                context,
-                modelClass: ModelClass.SMALL,
-            });
-
-            const rawTweetContent = cleanJsonResponse(response);
-
-            // First attempt to clean content
-            let tweetTextForPosting = null;
-            let mediaData = null;
-
-            // Try parsing as JSON first
-            const parsedResponse = parseJSONObjectFromText(rawTweetContent);
-            if (parsedResponse?.text) {
-                tweetTextForPosting = parsedResponse.text;
-            } else {
-                // If not JSON, use the raw text directly
-                tweetTextForPosting = rawTweetContent.trim();
-            }
-
-            if (
-                parsedResponse?.attachments &&
-                parsedResponse?.attachments.length > 0
-            ) {
-                mediaData = await fetchMediaData(parsedResponse.attachments);
-            }
-
-            // Try extracting text attribute
-            if (!tweetTextForPosting) {
-                const parsingText = extractAttributes(rawTweetContent, [
-                    "text",
-                ]).text;
-                if (parsingText) {
-                    tweetTextForPosting = truncateToCompleteSentence(
-                        extractAttributes(rawTweetContent, ["text"]).text,
-                        this.client.twitterConfig.MAX_TWEET_LENGTH
-                    );
-                }
-            }
-
-            // Use the raw text
-            if (!tweetTextForPosting) {
-                tweetTextForPosting = rawTweetContent;
-            }
-
-            // Truncate the content to the maximum tweet length specified in the environment settings, ensuring the truncation respects sentence boundaries.
-            if (maxTweetLength) {
-                tweetTextForPosting = truncateToCompleteSentence(
-                    tweetTextForPosting,
-                    maxTweetLength
-                );
-            }
-
-            const removeQuotes = (str: string) =>
-                str.replace(/^['"](.*)['"]$/, "$1");
-
-            const fixNewLines = (str: string) => str.replaceAll(/\\n/g, "\n\n"); //ensures double spaces
-
-            // Final cleaning
-            tweetTextForPosting = removeQuotes(
-                fixNewLines(tweetTextForPosting)
-            );
-
-            if (this.isDryRun) {
-                elizaLogger.info(
-                    `Dry run: would have posted tweet: ${tweetTextForPosting}`
-                );
-                return;
-            }
-
+            elizaLogger.log("Generating tweet text");
             try {
-                if (this.approvalRequired) {
-                    // Send for approval instead of posting directly
-                    elizaLogger.log(
-                        `Sending Tweet For Approval:\n ${tweetTextForPosting}`
-                    );
-                    await this.sendForApproval(
-                        tweetTextForPosting,
-                        roomId,
-                        rawTweetContent
-                    );
-                    elizaLogger.log("Tweet sent for approval");
+                const response = await generateText({
+                    runtime: this.runtime,
+                    context,
+                    modelClass: ModelClass.SMALL,
+                });
+                
+                elizaLogger.log("Successfully generated tweet text");
+                
+                const rawTweetContent = cleanJsonResponse(response);
+
+                // First attempt to clean content
+                let tweetTextForPosting = null;
+                let mediaData = null;
+
+                // Try parsing as JSON first
+                const parsedResponse = parseJSONObjectFromText(rawTweetContent);
+                if (parsedResponse?.text) {
+                    tweetTextForPosting = parsedResponse.text;
                 } else {
-                    elizaLogger.log(
-                        `Posting new tweet:\n ${tweetTextForPosting}`
-                    );
-                    this.postTweet(
-                        this.runtime,
-                        this.client,
+                    // If not JSON, use the raw text directly
+                    tweetTextForPosting = rawTweetContent.trim();
+                }
+
+                if (
+                    parsedResponse?.attachments &&
+                    parsedResponse?.attachments.length > 0
+                ) {
+                    mediaData = await fetchMediaData(parsedResponse.attachments);
+                }
+
+                // Try extracting text attribute
+                if (!tweetTextForPosting) {
+                    const parsingText = extractAttributes(rawTweetContent, [
+                        "text",
+                    ]).text;
+                    if (parsingText) {
+                        tweetTextForPosting = truncateToCompleteSentence(
+                            extractAttributes(rawTweetContent, ["text"]).text,
+                            this.client.twitterConfig.MAX_TWEET_LENGTH
+                        );
+                    }
+                }
+
+                // Use the raw text
+                if (!tweetTextForPosting) {
+                    tweetTextForPosting = rawTweetContent;
+                }
+
+                // Truncate the content to the maximum tweet length specified in the environment settings, ensuring the truncation respects sentence boundaries.
+                if (maxTweetLength) {
+                    tweetTextForPosting = truncateToCompleteSentence(
                         tweetTextForPosting,
-                        roomId,
-                        rawTweetContent,
-                        this.twitterUsername,
-                        mediaData
+                        maxTweetLength
                     );
                 }
-            } catch (error) {
-                elizaLogger.error("Error sending tweet:", error);
+
+                const removeQuotes = (str: string) =>
+                    str.replace(/^['"](.*)['"]$/, "$1");
+
+                const fixNewLines = (str: string) => str.replaceAll(/\\n/g, "\n\n"); //ensures double spaces
+
+                // Final cleaning
+                tweetTextForPosting = removeQuotes(
+                    fixNewLines(tweetTextForPosting)
+                );
+
+                if (this.isDryRun) {
+                    elizaLogger.info("=== DRY RUN MODE ===");
+                    elizaLogger.info(`Tweet content: ${tweetTextForPosting}`);
+                    
+                    if (axieData) {
+                        elizaLogger.info(`Used Axie data: ${axieData.text}`);
+                    }
+                    
+                    elizaLogger.info(`Raw tweet content: ${rawTweetContent}`);
+                    elizaLogger.info("No actual tweet was posted (dry run mode)");
+                    return;
+                }
+
+                try {
+                    if (this.approvalRequired) {
+                        // Send for approval instead of posting directly
+                        elizaLogger.log(
+                            `Sending Tweet For Approval:\n ${tweetTextForPosting}`
+                        );
+                        await this.sendForApproval(
+                            tweetTextForPosting,
+                            roomId,
+                            rawTweetContent
+                        );
+                        elizaLogger.log("Tweet sent for approval");
+                    } else {
+                        elizaLogger.log(
+                            `Posting new tweet:\n ${tweetTextForPosting}`
+                        );
+                        this.postTweet(
+                            this.runtime,
+                            this.client,
+                            tweetTextForPosting,
+                            roomId,
+                            rawTweetContent,
+                            this.twitterUsername,
+                            mediaData
+                        );
+                    }
+                } catch (error) {
+                    elizaLogger.error("Error sending tweet:", error);
+                }
+            } catch (textGenError) {
+                elizaLogger.error("Error in text generation step:", textGenError);
+                throw textGenError;
             }
         } catch (error) {
             elizaLogger.error("Error generating new tweet:", error);
+            // Log more details about the error
+            if (error instanceof Error) {
+                elizaLogger.error(`Error name: ${error.name}`);
+                elizaLogger.error(`Error message: ${error.message}`);
+                elizaLogger.error(`Error stack: ${error.stack}`);
+            } else {
+                elizaLogger.error(`Non-Error object thrown: ${JSON.stringify(error)}`);
+            }
+        }
+    }
+
+    /**
+     * Fetches Axie data for tweet generation
+     * @returns Promise with Axie data or null if unavailable
+     */
+    private async fetchAxieDataForTweet() {
+        try {
+            // Cache for Axie data to avoid repeated API calls
+            if (!this.axieDataCache) {
+                this.axieDataCache = new Map();
+            }
+            
+            const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+            
+            // Randomly select Axie type and metric
+            const axieTypes = ['summer', 'japan', 'origin', 'mystic', 'xmas', 'charms'];
+            const metrics = ['volume', 'holders', 'floor'];
+            
+            // Get data for a random selection of Axie types and metrics
+            const selectedType = axieTypes[Math.floor(Math.random() * axieTypes.length)];
+            const selectedMetric = metrics[Math.floor(Math.random() * metrics.length)];
+            
+            elizaLogger.info(`Fetching Axie data for ${selectedType} ${selectedMetric}`);
+            
+            const cacheKey = `${selectedType}-${selectedMetric}`;
+            const cachedData = this.axieDataCache.get(cacheKey);
+            
+            // Return cached data if it exists and is not expired
+            if (cachedData && (Date.now() - cachedData.timestamp < CACHE_TTL)) {
+                elizaLogger.debug(`Using cached Axie data for ${cacheKey}`);
+                return cachedData.data;
+            }
+            
+            // Create a simulated message to pass to the RPCAction
+            const simulatedMessage = {
+                content: {
+                    text: `Fetch the ${selectedMetric} for ${selectedType} Axies`
+                }
+            };
+            
+            // Find the RPCAction from the runtime
+            const rpcAction = this.runtime.actions.find(action => action.name === "RPC_ACTION");
+            if (!rpcAction) {
+                elizaLogger.warn("RPC_ACTION not found in runtime actions");
+                return null;
+            }
+            
+            // Create a promise to receive the callback data
+            const axieData = await new Promise<any>(resolve => {
+                const callback = (response) => {
+                    resolve(response);
+                };
+                
+                rpcAction.handler(
+                    this.runtime,
+                    simulatedMessage as Memory,
+                    {} as State,
+                    {},
+                    callback as HandlerCallback
+                );
+            });
+            
+            // Log the fetched data
+            elizaLogger.info(`Fetched Axie data: ${JSON.stringify(axieData)}`);
+            
+            // Cache the result with type checking
+            if (axieData && 
+                typeof axieData === 'object' && 
+                'content' in axieData && 
+                axieData.content && 
+                'success' in axieData.content) {
+                this.axieDataCache.set(cacheKey, {
+                    data: axieData,
+                    timestamp: Date.now()
+                });
+            }
+            
+            return axieData;
+        } catch (error) {
+            elizaLogger.error("Error fetching Axie data for tweet:", error);
+            return null;
         }
     }
 
